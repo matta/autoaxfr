@@ -1,0 +1,130 @@
+#!/usr/bin/perl -T
+# Copyright (c) 2000 Matt Armstrong <matt@lickey.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+
+use strict;
+$^W = 1;
+
+my $me = "autoaxfr-conf";
+
+if (@ARGV != 3) {
+    print "$me: usage: $me acct logacct directory\n";
+    exit(3);
+}
+
+sub check_user {
+    my $user = shift;
+    if ($user =~ /^(\w+)$/) {
+	$user = $1;
+    } else {
+	die "$me: bad user <$user>";
+    }
+    my ($login, $pass, $uid, $gid) = getpwnam($user)
+	or die "$me: unknown account $user";
+    die "$me: do not use root for this program" if $uid == 0;
+    return ($user, $uid, $gid);
+}
+
+my ($acct, $acct_uid, $acct_gid) = check_user $ARGV[0];
+my ($logacct, $logacct_uid, $logacct_gid) = check_user $ARGV[1];
+
+# state vars for the file/directory creation functions below
+my $dir;
+my $fn;
+
+unless ($ARGV[2] =~ m/^(\/\S+)$/) {
+    die "$me: bad directory $ARGV[2]"
+}
+$dir = $1;
+
+# djb style functions
+sub makedir {
+    $fn = shift;
+    mkdir($fn, 0700) or die "$me: unable to create $dir/$fn: $!";
+}
+sub perm {
+    my $mode = shift;
+    chmod($mode, $fn) or die "$me: unable to set mode of $dir/$fn: $!";
+}
+sub owner {
+    my $uid = shift;
+    my $gid = shift;
+    chown($uid, $gid, $fn)
+		    or die "$me: unable to set owner of $dir/$fn: $!";
+}
+sub start {
+	$fn = shift;
+	open(OUT, ">$fn") or die "$me: unable to create $dir/$fn: $!";
+}
+sub finish {
+	close(OUT) or die "$me: can't close $dir/$fn: $!";
+}
+
+umask(022) or die;
+
+# Create and chdir to DIR
+mkdir($dir, 0700) or die "$me: unable to create $dir: $!";
+chmod(03755, $dir) or die "$me: unable to set mode of $dir: $!";
+chdir($dir) or die "$me: unable to switch to $dir: $!";
+
+# Create DIR/log and DIR/log/main
+makedir("log");
+perm(02755);
+makedir("log/main");
+owner($logacct_uid, $logacct_gid);
+perm(02755);
+
+# Create DIR/log/run
+start('log/run');
+print OUT <<EOF;
+#!/bin/sh
+exec setuidgid $logacct multilog t ./main
+EOF
+finish;
+perm(0755);
+
+# Create DIR/run
+start('run');
+print OUT <<EOF;
+#!/bin/sh
+exec 2>&1
+ROOT=$dir/root; export ROOT
+exec setuidgid $acct /usr/local/bin/autoaxfr
+EOF
+finish;
+perm(0755);
+
+# Create DIR/root, DIR/slaves, DIR/zones and DIR/temp dirs.
+makedir('root');
+perm(02755);
+makedir('root/slaves');
+perm(02755);
+makedir('root/zones');
+perm(02755);
+owner($acct_uid, $acct_gid);
+makedir('root/temp');
+perm(02755);
+owner($acct_uid, $acct_gid);
+
+# vim: ts=8 sw=4

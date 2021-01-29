@@ -1,0 +1,177 @@
+#!/usr/bin/perl
+# Copyright (c) 2000 Matt Armstrong <matt@lickey.com>
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions
+# are met:
+# 1. Redistributions of source code must retain the above copyright
+#    notice, this list of conditions and the following disclaimer.
+# 2. Redistributions in binary form must reproduce the above copyright
+#    notice, this list of conditions and the following disclaimer in the
+#    documentation and/or other materials provided with the distribution.
+#
+# THIS SOFTWARE IS PROVIDED BY THE AUTHOR AND CONTRIBUTORS ``AS IS'' AND
+# ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
+# ARE DISCLAIMED.  IN NO EVENT SHALL THE AUTHOR OR CONTRIBUTORS BE LIABLE
+# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
+# OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
+# HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+# LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
+# OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
+# SUCH DAMAGE.
+
+require 5.0;
+use English;
+use strict;
+$^W = 1;
+$| = 1;
+
+my $me = 'autoaxfr';
+
+die "$me: don't run as root" if ($UID == 0);
+
+my %soa_retry;
+my %next_try;
+
+die "$me: no ROOT environment variable" unless defined $ENV{'ROOT'};
+my $root = $ENV{'ROOT'};
+chdir($root) || die "$me: can't chdir($root): $!";
+
+# Is it time to refresh a given slave yet?
+sub time_to_refresh_slave {
+    my $slave = shift;
+    if (!defined $next_try{$slave} || $next_try{$slave} <= time()) {
+	return 1;
+    }
+    return 0;
+}
+
+# given a file, what is the SOA serial number?
+sub get_serial {
+    my $fn = shift;
+    my $serial = 0;
+    if (open(F, $fn)) {
+    	my $line = <F>;
+	if (defined $line && $line =~ /^#(\d+) auto axfr-get$/) {
+	    $serial = $1;
+	}
+	close(F);
+    }
+    return $serial;
+}
+
+# got a zone, so read its SOA and initialize soa_retry{zone} and
+# next_try{zone}.
+sub got_zone {
+    my $slave = shift;
+    my $retval = 0;
+
+    if (open(ZONE, "zones/$slave")) {
+	while (<ZONE>) {
+	    chomp;
+	    if (/^Z/) {
+		my @zone = split(/:/, $_);
+		my $fqdn = $zone[0];
+		$fqdn =~ s/^Z//;
+		my $ref = $zone[4];
+		my $ret = $zone[5];
+		print "$me: zones/$slave, got domain $fqdn refresh $ref " .
+			"retry $ret\n";
+		my $slave = $fqdn eq "." ? "@" : $fqdn;
+		$soa_retry{$slave} = $ret;
+		$next_try{$slave} = time() + $ref;
+		$retval = 1;
+	    }
+	}
+    }
+    close(ZONE);
+    return $retval;
+}
+
+# sleep until the next refresh time.
+sub sleep_until_next_try {
+
+    my $now = time();
+
+    # Sleep a max of an hour, but possibly less depending on slave
+    # zone retry.
+    my $refresh_time = $now + 60 * 60;
+    foreach (keys %next_try) {
+	if ($next_try{$_} < $refresh_time) {
+	    $refresh_time = $next_try{$_};
+	}
+    }
+    my $sleep_time = $refresh_time - $now;
+
+    # Never sleep less than 1 second.
+    $sleep_time = 1 if $sleep_time <= 0;
+
+    print "$me: sleeping $sleep_time\n";
+
+    sleep($sleep_time);
+}
+
+
+# Possibly do an axfr for each zone in the slaves dir.
+sub process_requests {
+    opendir(DIR, 'slaves') || die "$me: can't opendir $.: $!";
+    my %slaves;
+    foreach (readdir(DIR)) {
+	next if /^\./;
+	$slaves{$_} = 1;
+    }
+    closedir DIR;
+
+    my $slave_file;
+    foreach $slave_file (sort keys %slaves) {
+
+	my $slave = $slave_file;
+	$slave =~ s/^slave\.//;
+
+	if (time_to_refresh_slave($slave)) {
+	    open(SLAVE, "slaves/$slave_file") 
+			    || die "$me: can't open(slaves/$slave_file): $!";
+	    my @addrs = <SLAVE>;
+	    close(SLAVE);
+	    chomp @addrs;
+	    my $addr;
+
+	    # try an axfr for each ip listed in the slave file until
+	    # one works
+	    foreach $addr (@addrs) {
+		print "$me: fetching $slave from $addr\n";
+		my $slave_domain = $slave eq "@" ? "." : $slave;
+		if (!system('tcpclient', '-v', $addr, 'domain', 'axfr-get', 
+			    $slave_domain, "zones/$slave",
+			    "temp/$slave")) {
+		    last;
+		}
+	    }
+
+	    # Get retry/refresh values from the fetched zone.
+	    if (!got_zone($slave)) {
+		# No zone?  Try again in 10 minutes.
+		$next_try{$slave} = time() + 600;
+	    }
+	}
+    }
+
+    # Get rid of keys in %next_try and %soa_retry that aren't in @slaves.
+    # The admin might have deleted a slave domain.
+    foreach (keys %next_try) {
+	delete $next_try{$_} unless exists $slaves{$_};
+    }
+    foreach (keys %soa_retry) {
+	delete $soa_retry{$_} unless exists $slaves{$_};
+    }
+}
+
+while (1) {
+    process_requests();
+    sleep_until_next_try();
+}
+
+# vim: ts=8 sw=4
